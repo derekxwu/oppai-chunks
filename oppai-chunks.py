@@ -1,46 +1,60 @@
+#!/usr/bin/python3
 """oppai-chunks
+
+ Moving-window difficulty calculation for osu beatmaps.
+ Intended for mappers to check difficulty spikes/dips.
+
+ Run in CLI as ./oppai-chunks.py <path_to_beatmap>
+ Import oppai() and run oppai('path_to_beatmap')
 """
 import codecs
-import os
+import json
 import subprocess
 import sys
 import tempfile
-
-if os.name == 'nt':
-    LINE_ENDING = '\r\n'
-else:
-    LINE_ENDING = '\n'
 
 
 def print_usage():
     """Instructions on using the script
     """
-    print("Hello")
+    print(
+        "oppai-chunks.py\n"
+        "Usage: ./oppai-chunks.py <beatmap>\n"
+        "<beatmap> is a .osu file for a specific difficulty.\n"
+        "You can unzip a .osz file to extract the .osu files.\n"
+    )
 
 
 def oppai(bmname):
     """Open beatmap and process
 
-    Opens beatmap passed as argument and runs chunks through oppai.
-    Current implementation is printing to named pipe and running oppai
-    several times.
+    Runs oppai on chunks (30sec) of the beatmap at regular intervals (5sec).
 
     Arguments:
         bmname {str} -- Path to beatmap
+
+    Returns:
+        list -- A list of tuples for each chunk formatted as follows:
+        (chunk start time (ms), overall stars, aim stars, speed stars)
     """
+
+    # Very efficient parsing
+    # I think it's awful please contribute anything better
+    # For a challenge, keep pylint happy while you do it
     try:
         with codecs.open(bmname, 'r', 'utf-8') as file:
             bmap = file.readlines()
-    except EnvironmentError:
+    except IOError:
         print("Error opening file: {}".format(bmname))
         sys.exit()
 
-    # Very efficient parsing
-    metadata = bmap[:bmap.index('[HitObjects]' + LINE_ENDING)]
-    bmap = bmap[bmap.index('[HitObjects]' + LINE_ENDING) + 1:]
+    # Split into hitcircles and not hitcircles
+    metadata = bmap[:bmap.index('[HitObjects]\r\n')]
+    bmap = bmap[bmap.index('[HitObjects]\r\n') + 1:]
 
     bm_info = {}
 
+    # This is the awful part
     bm_info['Title'] = [x for x in metadata if x.startswith('Title:')]
     bm_info['Artist'] = [x for x in metadata if x.startswith('Artist:')]
     bm_info['Mapper'] = [x for x in metadata if x.startswith('Creator:')]
@@ -51,48 +65,65 @@ def oppai(bmname):
     bm_info['AR'] = [x for x in metadata if x.startswith('ApproachRate:')]
     bm_info['SV'] = [x for x in metadata if x.startswith('SliderMultiplier:')]
     bm_info['TR'] = [x for x in metadata if x.startswith('SliderTickRate:')]
+
     if [] in bm_info.values():
-        for prop in [x for x in bm_info if bm_info[x] == []]:
-            print("Error: Missing beatmap info: {}".format(prop))
-        sys.exit()
+        for field in [x for x in bm_info if bm_info[x] == []]:
+            print("Error: Missing beatmap info: {}".format(field))
+            print("\tTry resaving the beatmap from the osu editor.")
+        sys.exit(1)
+
+    # Recover from using a list comprehension for everything
     for key in bm_info:
         bm_info[key] = bm_info[key][0]
 
+    # The one line with a guaranteed position
     bm_info['format_ver'] = metadata[0]
 
+    # Compose the necessary heading parts to keep oppai happy
+    # and enable difficulty calculation
     bm_head = ''.join((bm_info['format_ver'],
-                       '[General]' + LINE_ENDING,
-                       '[Metadata]' + LINE_ENDING,
+                       '[General]\r\n',
+                       '[Metadata]\r\n',
                        bm_info['Title'],
                        bm_info['Artist'],
                        bm_info['Mapper'],
                        bm_info['Diff name'],
-                       '[Difficulty]' + LINE_ENDING,
+                       '[Difficulty]\r\n',
                        bm_info['HP'],
                        bm_info['CS'],
                        bm_info['OD'],
                        bm_info['AR'],
                        bm_info['SV'],
                        bm_info['TR'],
-                       '[TimingPoints]' + LINE_ENDING,
-                       '[HitObjects]' + LINE_ENDING))
+                       '[TimingPoints]\r\n',
+                       '[HitObjects]\r\n'))
 
-    results = []
-    seek = 0
+    results = []  # Array of (time, stars, aim stars, speed stars) tuples
+    seek = 0  # Time in ms
     with tempfile.TemporaryDirectory() as tmpdir:
         while bmap:
+            # 30 second window size
+            # TODO: Make this configurable
             out = ''.join(
                 [x for x in bmap if int(x.split(',')[2]) < seek + 30000])
 
-            with open(tmpdir + '/tmp', 'w') as tmp:
+            with open(tmpdir + '/tmp.osu', 'w') as tmp:
                 tmp.write(bm_head + out)
 
+            # Use omkelderman's json-output fork of oppai
+            # https://github.com/omkelderman/oppai/tree/json-output
+            # TODO: Of course, make the oppai path configurable
             oppai_out = subprocess.check_output(
-                ["oppai/oppai.exe", tmpdir + '/tmp'])
+                ["oppai", tmpdir + '/tmp.osu'])
+            oppai_out = json.loads(oppai_out.decode())
 
-            print(oppai_out.decode())
-            results.append(('a', 'b', 'c', 'd'))
+            results.append((seek,
+                            float(oppai_out['stars']),
+                            float(oppai_out['aim_stars']),
+                            float(oppai_out['speed_stars'])))
 
+            # Move in 5-second steps
+            # TODO: Make this configurable too
             seek = seek + 5000
             bmap = [x for x in bmap if int(x.split(',')[2]) > seek]
 
@@ -102,21 +133,20 @@ def oppai(bmname):
 def main():
     """oppai-chunks from CLI
 
-    Print results when run, e.g. ./oppai-chunks.py beatmap.osu
+    Prints table of time|stars|aim|speed when run
+    ./oppai-chunks.py beatmap.osu
     """
-    if len(sys.argv) != 2:
+    if len(sys.argv) != 2 or not sys.argv[1].endswith('.osu'):
         print_usage()
         sys.exit()
 
-    print("\nAnalyzing \"{}\"...".format(sys.argv[1]))
+    print("Analyzing \"{}\"...".format(sys.argv[1]))
 
     results = oppai(sys.argv[1])
 
     print("Time\tOverall\tAim\tSpeed")
-    bigprint = ""
     for chunk in results:
-        bigprint += "{}\t{}\t{}\t{}\n".format(*chunk)
-    print(bigprint)
+        print("{}\t{}\t{}\t{}".format(*chunk))
 
 if __name__ == '__main__':
     main()
