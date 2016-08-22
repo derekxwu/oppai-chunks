@@ -13,48 +13,87 @@ import subprocess
 import sys
 import tempfile
 
+# Replace if oppai-json is not in your PATH
+OPPAI_PATH = "oppai"
+
 
 def print_usage():
     """Instructions on using the script
     """
     print(
         "oppai-chunks.py\n"
-        "Usage: ./oppai-chunks.py <beatmap>\n"
-        "<beatmap> is a .osu file for a specific difficulty.\n"
+        "Usage: ./oppai-chunks.py beatmap [window [step]]\n"
+        "beatmap is a .osu file for a specific difficulty.\n"
+        "window is a number indicating the window size in ms\n"
+        "step is a number indicating the step size in ms\n"
         "You can unzip a .osz file to extract the .osu files.\n"
     )
 
 
-def oppai(bmname):
-    """Open beatmap and process
+class ParseError(Exception):
+    """Given file doesn't fit expected .osu format"""
+    pass
 
-    Runs oppai on chunks (30sec) of the beatmap at regular intervals (5sec).
+
+def read(bmap):
+    """Read in beatmap and split it into metadata and hitcircles
+
+    Given a filename or the beatmap in one string or a list of lines,
+    return two lists of lines - beatmap metadata and hit objects.
 
     Arguments:
-        bmname {str} -- Path to beatmap
+        bmap {str, str list} -- filename (file.osu), or an already read
+        beatmap as a single string (file.read) or lines (file.readlines)
 
     Returns:
-        list -- A list of tuples for each chunk formatted as follows:
-        (chunk start time (ms), overall stars, aim stars, speed stars)
+        (str list, str list) -- (metadata, hitcircles)
+
+    Raises:
+        ParseError -- If [Hitobjects] not found (not an .osu file)
     """
+    if bmap[-4:] == '.osu':
+        # filename
+        with codecs.open(bmap, 'r', 'utf-8') as beatmap:
+            map_lines = beatmap.readlines()
+    else:
+        try:
+            # file.read
+            map_lines = bmap.split('\n')
+        except AttributeError:
+            # file.readlines
+            map_lines = bmap
 
-    # Very efficient parsing
-    # I think it's awful please contribute anything better
-    # For a challenge, keep pylint happy while you do it
-    try:
-        with codecs.open(bmname, 'r', 'utf-8') as file:
-            bmap = file.readlines()
-    except IOError:
-        print("Error opening file: {}".format(bmname))
-        sys.exit()
+    try:  # Unicode life
+        for i, line in enumerate(map_lines):
+            map_lines[i] = line.decode()
+    except AttributeError:
+        # Already decoded
+        pass
 
-    # Split into hitcircles and not hitcircles
-    metadata = bmap[:bmap.index('[HitObjects]\r\n')]
-    bmap = bmap[bmap.index('[HitObjects]\r\n') + 1:]
+    index = -1
+    for i, line in enumerate(map_lines):
+        if line.startswith('[HitObjects]'):
+            index = i
+            break
+    if index == -1:
+        raise ParseError('Missing "[HitObjects]"')
 
+    metadata = map_lines[:index]
+    hitcircles = map_lines[index + 1:]
+    return (metadata, hitcircles)
+
+
+def parse_meta(metadata):
+    """Parse necessary metadata lines from the beatmap.
+
+    Arguments:
+        metadata {str list} -- Metadata section of beatmap
+
+    Raises:
+        ParseError -- For missing fields
+    """
     bm_info = {}
 
-    # This is the awful part
     bm_info['Title'] = [x for x in metadata if x.startswith('Title:')]
     bm_info['Artist'] = [x for x in metadata if x.startswith('Artist:')]
     bm_info['Mapper'] = [x for x in metadata if x.startswith('Creator:')]
@@ -67,14 +106,11 @@ def oppai(bmname):
     bm_info['TR'] = [x for x in metadata if x.startswith('SliderTickRate:')]
 
     if [] in bm_info.values():
-        for field in [x for x in bm_info if bm_info[x] == []]:
-            print("Error: Missing beatmap info: {}".format(field))
-            print("\tTry resaving the beatmap from the osu editor.")
-        sys.exit(1)
+        missing = [x for x in bm_info if bm_info[x] == []]
+        raise ParseError(', '.join(missing))
 
     # Recover from using a list comprehension for everything
-    for key in bm_info:
-        bm_info[key] = bm_info[key][0]
+    bm_info = {x: bm_info[x][0] for x in bm_info}
 
     # The one line with a guaranteed position
     bm_info['format_ver'] = metadata[0]
@@ -97,24 +133,52 @@ def oppai(bmname):
                        bm_info['TR'],
                        '[TimingPoints]\r\n',
                        '[HitObjects]\r\n'))
+    return bm_head
+
+
+def oppai(bmap, window_length=30000, step_size=5000):
+    """Open beatmap and process
+
+    Runs oppai on chunks (default 30 sec windows) of the beatmap at regular
+    intervals (default 5 second step).
+
+    Arguments:
+        bmap {} -- the lines of a beatmap file
+        window_length {int} -- Window length in ms
+        step_size {int} --- Step size in ms
+
+    Returns:
+        {list} -- A list of tuples for each chunk formatted as follows:
+            (chunk start time (ms), overall stars, aim stars, speed stars)
+    """
+    metadata, hitcircles = read(bmap)
+    bm_head = parse_meta(metadata)
 
     results = []  # Array of (time, stars, aim stars, speed stars) tuples
     seek = 0  # Time in ms
     with tempfile.TemporaryDirectory() as tmpdir:
-        while bmap:
-            # 30 second window size
-            # TODO: Make this configurable
-            out = ''.join(
-                [x for x in bmap if int(x.split(',')[2]) < seek + 30000])
+        while hitcircles:
+            # Slice out window of beatmap
+            try:
+                window = [x for x in hitcircles
+                          if int(x.split(',')[2]) < seek + window_length]
+            except IndexError:
+                raise ParseError('Unexpected line in [HitObjects] section')
+            if len(window) == 0:
+                results.append((seek, 0.0, 0.0, 0.0))
+                seek = seek + 5000
+                hitcircles = [x for x in hitcircles
+                              if int(x.split(',')[2]) > seek]
+                continue
+            out = ''.join(window)
 
-            with open(tmpdir + '/tmp.osu', 'w') as tmp:
+            with open(tmpdir + '/tmp.osu', 'w', encoding='utf-8') as tmp:
                 tmp.write(bm_head + out)
 
             # Use omkelderman's json-output fork of oppai
             # https://github.com/omkelderman/oppai/tree/json-output
-            # TODO: Of course, make the oppai path configurable
             oppai_out = subprocess.check_output(
-                ["oppai", tmpdir + '/tmp.osu'])
+                [OPPAI_PATH, tmpdir + '/tmp.osu'])
             oppai_out = json.loads(oppai_out.decode())
 
             results.append((seek,
@@ -122,11 +186,10 @@ def oppai(bmname):
                             float(oppai_out['aim_stars']),
                             float(oppai_out['speed_stars'])))
 
-            # Move in 5-second steps
-            # TODO: Make this configurable too
-            seek = seek + 5000
-            bmap = [x for x in bmap if int(x.split(',')[2]) > seek]
-
+            # Step to next window
+            seek = seek + step_size
+            hitcircles = [x for x in hitcircles
+                          if int(x.split(',')[2]) > seek]
     return results
 
 
@@ -136,13 +199,16 @@ def main():
     Prints table of time|stars|aim|speed when run
     ./oppai-chunks.py beatmap.osu
     """
-    if len(sys.argv) != 2 or not sys.argv[1].endswith('.osu'):
+    if len(sys.argv) > 4 or not sys.argv[1].endswith('.osu'):
         print_usage()
         sys.exit()
 
     print("Analyzing \"{}\"...".format(sys.argv[1]))
-
-    results = oppai(sys.argv[1])
+    try:
+    	results = oppai(sys.argv[1], *[int(x) for x in sys.argv[2:]])
+    except ValueError:
+        print_usage()
+        sys.exit()
 
     print("Time\tOverall\tAim\tSpeed")
     for chunk in results:
