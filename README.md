@@ -1,5 +1,4 @@
 # oppai-chunks
-http://rarelyupset.com/oppai/
 
 Calculate the difficulty over time of a beatmap with moving windows.
 
